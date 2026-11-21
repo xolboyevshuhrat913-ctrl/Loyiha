@@ -1,0 +1,100 @@
+name: CD
+
+# CI muvaffaqiyatli o'tgach (main'ga push), image yig'ilib Docker Hub'ga
+# yuklanadi va serverda yangilanadi. Qo'lda ham ishga tushirsa bo'ladi.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/vektorops-landing
+  CONTAINER: vektorops-landing
+  # Serverdagi port: IP orqali ochish uchun 80 -> konteyner 8080.
+  # Keyin nginx + domen ulansa: 127.0.0.1:8080:8080 qiling (Variables'da PORT_MAP)
+  PORT_MAP: ${{ vars.PORT_MAP || '80:8080' }}
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  deploy:
+    name: Build, push va deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    # workflow_run'da faqat CI muvaffaqiyatli va push bo'lsa; qo'lda har doim
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      # --- 1) Dockerfile'dan image yig'ib, Docker Hub'ga yuklash ---
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.SHA }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- 2) Serverga ulanib, yangi image'ni ishga tushirish ---
+      - name: SSH sozlash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Serverda yangilash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+            "IMAGE='$IMAGE_NAME:$SHA' CONTAINER='$CONTAINER' PORT_MAP='$PORT_MAP' bash -s" <<'REMOTE'
+          set -e
+          docker pull "$IMAGE"
+          docker rm -f "$CONTAINER" 2>/dev/null || true
+          docker run -d --name "$CONTAINER" --restart unless-stopped \
+            -p "$PORT_MAP" "$IMAGE"
+
+          # Konteyner "healthy" bo'lishini kutamiz (eng ko'pi bilan 60 soniya)
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$CONTAINER")
+            [ "$status" = "healthy" ] && echo "Deploy muvaffaqiyatli" && break
+            sleep 2
+          done
+          if [ "$status" != "healthy" ]; then
+            echo "Konteyner sog'lom emas: $status"
+            docker logs --tail 50 "$CONTAINER"
+            exit 1
+          fi
+          docker image prune -f
+          REMOTE
