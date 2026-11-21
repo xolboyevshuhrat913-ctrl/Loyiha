@@ -1,8 +1,14 @@
 FROM python:3.13-alpine
 
+RUN adduser -D -h /site appuser
 WORKDIR /site
 
-COPY . .   
+COPY index.html ./
+COPY css/    ./css/
+COPY js/     ./js/
+COPY assets/ ./assets/
+
+USER appuser
 EXPOSE 8001
 
 # CD shu orqali konteyner tayyor bo'lganini biladi
