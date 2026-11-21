@@ -1,7 +1,9 @@
 name: CD
 
-# CI muvaffaqiyatli o'tgach (main'ga push), image yig'ilib Docker Hub'ga
-# yuklanadi va serverda yangilanadi. Qo'lda ham ishga tushirsa bo'ladi.
+# CI main'da muvaffaqiyatli o'tgach:
+#   1) image yig'ilib Docker Hub'ga yuklanadi
+#   2) server Docker Hub'dan tortib, yangisini ishga tushiradi
+# Qo'lda ham ishga tushirsa bo'ladi (Actions -> CD -> Run workflow).
 on:
   workflow_run:
     workflows: [CI]
@@ -17,20 +19,14 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/vektorops-landing
-  CONTAINER: vektorops-landing
-  # Serverdagi port: IP orqali ochish uchun 80 -> konteyner 8080.
-  # Keyin nginx + domen ulansa: 127.0.0.1:8080:8080 qiling (Variables'da PORT_MAP)
-  PORT_MAP: ${{ vars.PORT_MAP || '80:8080' }}
   SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
-  deploy:
-    name: Build, push va deploy
+  # ---------- 1) Docker Hub'ga yuklash ----------
+  push:
+    name: Docker Hub'ga yuklash
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: production
-    # workflow_run'da faqat CI muvaffaqiyatli va push bo'lsa; qo'lda har doim
+    timeout-minutes: 10
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -40,7 +36,6 @@ jobs:
         with:
           ref: ${{ env.SHA }}
 
-      # --- 1) Dockerfile'dan image yig'ib, Docker Hub'ga yuklash ---
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -51,15 +46,20 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.SHA }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/vektorops-landing:${{ env.SHA }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/vektorops-landing:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # --- 2) Serverga ulanib, yangi image'ni ishga tushirish ---
+  # ---------- 2) Serverda ishga tushirish ----------
+  deploy:
+    name: Serverga deploy
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
       - name: SSH sozlash
         env:
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
@@ -71,30 +71,37 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts
 
-      - name: Serverda yangilash
+      - name: Serverda Docker Hub'dan tortib ishga tushirish
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vektorops-landing:${{ env.SHA }}
+          # Server porti:konteyner porti (sayt konteynerda 8001'da ishlaydi).
+          # Boshqa port kerak bo'lsa: Variables'da PORT_MAP (masalan 8001:8001)
+          PORT_MAP: ${{ vars.PORT_MAP || '80:8001' }}
         run: |
           ssh -i ~/.ssh/id_deploy -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
-            "IMAGE='$IMAGE_NAME:$SHA' CONTAINER='$CONTAINER' PORT_MAP='$PORT_MAP' bash -s" <<'REMOTE'
+            "IMAGE='$IMAGE' PORT_MAP='$PORT_MAP' bash -s" <<'REMOTE'
           set -e
-          docker pull "$IMAGE"
-          docker rm -f "$CONTAINER" 2>/dev/null || true
-          docker run -d --name "$CONTAINER" --restart unless-stopped \
-            -p "$PORT_MAP" "$IMAGE"
+          NAME=vektorops-landing
 
-          # Konteyner "healthy" bo'lishini kutamiz (eng ko'pi bilan 60 soniya)
+          docker pull "$IMAGE"
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" --restart unless-stopped -p "$PORT_MAP" "$IMAGE"
+
+          # "healthy" bo'lishini kutamiz (eng ko'pi bilan 60 soniya)
+          status=starting
           for i in $(seq 1 30); do
-            status=$(docker inspect --format '{{.State.Health.Status}}' "$CONTAINER")
-            [ "$status" = "healthy" ] && echo "Deploy muvaffaqiyatli" && break
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$NAME")
+            [ "$status" = "healthy" ] && break
             sleep 2
           done
           if [ "$status" != "healthy" ]; then
             echo "Konteyner sog'lom emas: $status"
-            docker logs --tail 50 "$CONTAINER"
+            docker logs --tail 50 "$NAME"
             exit 1
           fi
+          echo "Deploy muvaffaqiyatli: $IMAGE"
           docker image prune -f
           REMOTE

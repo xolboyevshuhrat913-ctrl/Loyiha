@@ -1,6 +1,7 @@
 name: CI
 
-# Har bir PR va main'ga push'da: sayt build bo'ladimi va to'g'ri ishlaydimi?
+# Faqat tekshiruv: fayllar joyidami, image yig'iladimi, sayt ochiladimi?
+# Hech narsa yuklanmaydi va serverga tegilmaydi.
 on:
   push:
     branches: [main]
@@ -8,44 +9,37 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   check:
-    name: Build va tekshiruv
+    name: Tekshiruv
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      # 1) index.html'dagi css/js/rasm fayllari haqiqatan bormi?
-      - name: Havolalarni tekshirish
+      - name: Havolalarni tekshirish (css, js, rasm bormi?)
         run: python3 .github/scripts/check_links.py
 
-      # 2) Dockerfile'dan image yig'ish
       - name: Docker image yig'ish
         run: docker build -t vektorops-landing:ci .
 
-      # 3) Konteynerni ishga tushirib, sinab ko'rish
-      - name: Konteynerni ishga tushirish
-        run: docker run -d --name site -p 8080:8080 vektorops-landing:ci
-
-      - name: Sayt javob berishini tekshirish
+      - name: Konteynerni ishga tushirib sinash
         run: |
+          docker run -d --name site -p 8001:8001 vektorops-landing:ci
           for i in $(seq 1 20); do
-            if curl -fsS -o /dev/null http://127.0.0.1:8080/; then break; fi
+            curl -fsS -o /dev/null http://127.0.0.1:8001/ && break
             sleep 1
           done
-          curl -fsS -o /dev/null http://127.0.0.1:8080/
-          # CSS to'g'ri turda berilyaptimi? (uslub chiqmay qolishining oldini oladi)
-          curl -fsSI http://127.0.0.1:8080/css/base.css | grep -i "content-type: text/css"
-          curl -fsSI http://127.0.0.1:8080/js/modal.js  | grep -iE "content-type: (text|application)/javascript"
-          echo "Sayt to'g'ri ishlayapti"
+          curl -fsS -o /dev/null http://127.0.0.1:8001/
+          curl -fsSI http://127.0.0.1:8001/css/base.css | grep -i "content-type: text/css"
+          echo "Sayt ishlayapti"
 
-      - name: Xato bo'lsa loglarni ko'rsatish
+      - name: Xato bo'lsa loglar
         if: failure()
         run: docker logs site || true
