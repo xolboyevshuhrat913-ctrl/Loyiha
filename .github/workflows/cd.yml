@@ -26,6 +26,7 @@ jobs:
   push:
     name: Docker Hub'ga yuklash
     runs-on: ubuntu-latest
+    environment: production
     timeout-minutes: 10
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -58,6 +59,7 @@ jobs:
     name: Serverga deploy
     needs: push
     runs-on: ubuntu-latest
+    environment: production
     timeout-minutes: 10
     steps:
       - name: SSH sozlash
